@@ -1,0 +1,170 @@
+Content Broadcasting System - Architecture Notes
+================================================
+
+1. AUTHENTICATION & RBAC FLOW
+------------------------------
+- JWT (JSON Web Token) based authentication
+- On login, server signs a JWT with user id, name, email, role (principal/teacher)
+- JWT is sent in Authorization header as "Bearer <token>" for protected routes
+- Two middleware functions:
+    authenticate → verifies token, attaches req.user
+    authorize(...roles) → checks req.user.role is in allowed list
+- RBAC:
+    Teacher  → can upload content, view their own content
+    Principal → can view all content, approve/reject
+
+No session state is stored. Stateless auth scales well.
+
+2. SUBJECT-BASED SYSTEM DESIGN
+--------------------------------
+- Each content item belongs to a subject (maths, science, etc.)
+- content_slots table maps (subject + teacher_id) → unique slot
+- Each slot has multiple content items in content_schedule with rotation_order + duration
+- This allows independent rotation per subject per teacher
+- Example: teacher-1/maths rotates Maths A→B→C, teacher-1/science rotates Science X→Y separately
+
+3. UPLOAD HANDLING APPROACH
+-----------------------------
+- Multer handles multipart/form-data
+- File type validation: only jpg, png, gif (by mimetype)
+- File size limit: configurable via MAX_FILE_SIZE_MB env var (default 10MB)
+- Storage strategy (auto-detected from env):
+    IF AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY + AWS_REGION + AWS_S3_BUCKET are all set:
+        → Use AWS S3 via multer-s3 (file.location gives the S3 URL)
+    ELSE:
+        → Use local disk storage in /uploads directory
+        → Files served statically via /uploads route
+- This fallback is transparent to controllers since getFileUrl() abstracts both
+
+4. APPROVAL WORKFLOW DESIGN
+-----------------------------
+Content Lifecycle:
+    uploaded → pending (default on upload)
+    pending  → approved (principal approves, content goes live)
+    pending  → rejected (principal rejects with mandatory reason)
+
+- Only principal can approve/reject (enforced via RBAC middleware)
+- Rejection must include a reason (validated in controller)
+- Approved content is visible in live API only if time window is active
+- Status is stored directly on the content row for simplicity
+
+5. SCHEDULING / ROTATION LOGIC (VERY IMPORTANT)
+-------------------------------------------------
+This is the core logic. No cron jobs or background workers needed.
+It's purely deterministic based on current time.
+
+Algorithm:
+    Step 1: Fetch all approved content for teacher + subject within active time window
+            (start_time <= NOW <= end_time)
+
+    Step 2: Sort by rotation_order
+
+    Step 3: Compute total_cycle_duration = SUM(all durations in minutes)
+
+    Step 4: elapsed_minutes = minutes since midnight (UTC) today
+
+    Step 5: position_in_cycle = elapsed_minutes % total_cycle_duration
+
+    Step 6: Walk through items accumulating duration until position_in_cycle is covered
+            → that item is currently active
+
+This loops continuously and is stateless. Any server instance gets the same result.
+
+Example:
+    Content A: duration=5, rotation_order=1
+    Content B: duration=5, rotation_order=2
+    Content C: duration=5, rotation_order=3
+    total_cycle = 15 minutes
+
+    At 9:03 AM → elapsed = 543 min → 543%15 = 3 → position=3 → falls in A (0-5)
+    At 9:07 AM → elapsed = 547 min → 547%15 = 7 → position=7 → falls in B (5-10)
+    At 9:12 AM → elapsed = 552 min → 552%15 = 12 → position=12 → falls in C (10-15)
+    At 9:17 AM → elapsed = 557 min → 557%15 = 2 → position=2 → falls in A again ✓
+
+Edge case handling:
+    - No approved content → "No content available"
+    - Content approved but no start/end time → not shown (time window check fails)
+    - Content outside time window → not shown
+    - Invalid teacher ID → "No content available" (not an error)
+    - Invalid subject → empty result returned
+
+6. DATABASE DESIGN DECISIONS
+------------------------------
+Tables:
+- users: stores both principals and teachers with role column
+- content: main content table with status lifecycle, file info, schedule times
+- content_slots: maps (subject + teacher_id) → acts as category/bucket
+- content_schedule: links content to slot with rotation_order and duration
+
+Why separate schedule table?
+- Allows reordering content without touching the content table
+- Duration is per-slot-item, not global
+- Future: could allow same content in multiple slots
+
+Foreign keys ensure cascade deletes (content deleted → schedule deleted)
+
+7. FOLDER STRUCTURE
+--------------------
+src/
+├── app.js              → Express app setup, route mounting
+├── config/
+│   ├── db.js           → MYSQL pool configuration
+│   └── storage.js      → Multer setup (S3 or local,cloudinary auto-detected)
+├── controllers/
+│   ├── auth.controller.js      → Register, login, me
+│   ├── content.controller.js   → Upload, view, approve, reject
+│   └── broadcast.controller.js → Public live content API
+├── middlewares/
+│   ├── auth.middleware.js  → authenticate + authorize
+│   └── error.middleware.js → Central error handler
+├── routes/
+│   ├── auth.routes.js
+│   ├── content.routes.js
+│   └── broadcast.routes.js
+├── services/
+│   └── scheduling.service.js → Core rotation logic
+└── utils/
+    ├── migrate.js → Creates DB tables
+    └── seed.js    → Inserts demo users
+
+8. MIDDLEWARE USAGE
+--------------------
+- cors()              → Allow cross-origin requests (students on mobile)
+- express.json()      → Parse JSON request bodies
+- authenticate        → JWT verification (all protected routes)
+- authorize(roles)    → Role check (principal vs teacher)
+- upload.single()     → File upload (multer)
+- rateLimit()         → Public API protection (60 req/min)
+- errorHandler        → Catches multer errors, DB errors, etc.
+
+9. SCALABILITY APPROACH
+------------------------
+Current implementation is solid for a school-scale system. For scale:
+
+Caching:
+- Redis cache on /content/live/:teacherId responses (TTL = shortest duration of active items)
+- Cache invalidation on approve/reject actions
+- This prevents DB hits on every student request
+
+Queue / Background jobs (future):
+- Use Bull/BullMQ for async file processing (if we add video support)
+- Upload to S3 in background instead of blocking request
+
+Database:
+- Index on: content.uploaded_by, content.status, content.subject, content.start_time/end_time
+- Connection pooling already in place via pg.Pool
+- Read replicas for public API (eventually)
+
+Rate Limiting:
+- Applied on public /live endpoint (60 req/min per IP)
+- Can move to Redis-backed rate limiter for multi-instance deployments
+
+Storage:
+- Local storage works for single server
+- S3 is production-ready (auto-selected if credentials present)
+- Both modes are abstracted via getFileUrl() — zero controller changes needed
+
+Assumptions:
+- Times are stored and compared in UTC
+- Rotation clock resets daily at midnight UTC (keeps it simple and predictable)
+- "pending" is the only status that can be approved/rejected (not re-approving)
